@@ -1,101 +1,119 @@
-#include <avr/io.h> // مكتبة الـ AVR القياسية للمنافذ
+#include <avr/io.h>
 #include "STD_TYPES.h"
 #include "BIT_MATH.h"
 #include "SPI.h"
-#include "RFID.h"  
+#include "RFID.h"
 
-#define CS_PORT   PORTB
-#define CS_PIN    4
+/* ====================================================================
+ * إعدادات الطرف الخاص بـ Chip Select (عدله حسب بن التوصيل عندك)
+ * ==================================================================== */
+#define CS_PORT    PORTB
+#define CS_DDR     DDRB
+#define CS_PIN     PIN4_ID  /* أو رقم البن 4 مباشرة */
 
-// --- CS Pin Control ---
-static void CS_Select(void) {
-	CLR_BIT(CS_PORT, CS_PIN); // CS = 0 (Active Low)
+#define SPI_WRITE_MASK   0x7E
+#define SPI_READ_MASK    0x80
+
+/* ====================================================================
+ * دوال التحكم المباشر بالـ Chip Select (Private Functions)
+ * ==================================================================== */
+static void CS_vSelect(void) {
+    CLR_BIT(CS_PORT, CS_PIN); // Low = Active
 }
 
-static void CS_Deselect(void) {
-	SET_BIT(CS_PORT, CS_PIN); // CS = 1 (Idle High)
+static void CS_vDeselect(void) {
+    SET_BIT(CS_PORT, CS_PIN); // High = Idle
 }
 
-// --- Low-Level Register Access ---
-void Write_Reg(u8 Copy_u8Addr, u8 Copy_u8Val) {
-	CS_Select();
-	SPI_transmit((Copy_u8Addr << 1) & 0x7E); // Bit 0 = 0 (Write)
-	SPI_transmit(Copy_u8Val);
-	CS_Deselect();
+/* ====================================================================
+ * تنفيذ الدوال الأساسية (Public Functions)
+ * ==================================================================== */
+
+void RFID_vWriteRegister(u8 Copy_u8RegAddr, u8 Copy_u8Val) {
+    CS_vSelect();
+    SPI_vTransmit(((Copy_u8RegAddr << 1) & SPI_WRITE_MASK));
+    SPI_vTransmit(Copy_u8Val);
+    CS_vDeselect();
 }
 
-u8 Read_Reg(u8 Copy_u8Addr) {
-	u8 Local_u8Val;
-	CS_Select();
-	SPI_transmit(((Copy_u8Addr << 1) & 0x7E) | 0x80); // Bit 7 = 1 (Read)
-	Local_u8Val = SPI_transmit(0x00);                  // Send Dummy Data
-	CS_Deselect();
-	return Local_u8Val;
+u8 RFID_u8ReadRegister(u8 Copy_u8RegAddr) {
+    u8 Local_u8Val = 0;
+    CS_vSelect();
+    SPI_vTransmit(((Copy_u8RegAddr << 1) & SPI_WRITE_MASK) | SPI_READ_MASK);
+    Local_u8Val = SPI_u8Receive();
+    CS_vDeselect();
+    return Local_u8Val;
 }
 
-u8 ToCard(u8 Copy_u8Command, u8 *Copy_pu8SendData, u8 Copy_u8SendLen, u8 *Copy_pu8BackData, u16 *Copy_pu16BackLen) {
-	u8 Local_u8Status = MI_ERR;
-	u8 Local_u8IrqEn = 0x77;
-	u8 Local_u8WaitIrq = 0x30;
-	u8 Local_u8N;
-	u16 Local_u16I;
+void RFID_vInit(void) {
+    /* ضبط طرف الـ CS كـ Output ورَفعه (Idle High) */
+    SET_BIT(CS_DDR, CS_PIN);
+    CS_vDeselect();
 
-	Write_Reg(CommIEnReg, Local_u8IrqEn | 0x80);
-	Write_Reg(CommIrqReg, 0x7F);
-	Write_Reg(CommandReg, PCD_IDLE);
-	Write_Reg(FIFOLevelReg, 0x80); // Clear FIFO
+    /* إعادة ضبط الشريحة (Soft Reset) */
+    RFID_vWriteRegister(MFRC522_REG_COMMAND, MFRC522_CMD_SOFT_RESET);
 
-	for (Local_u16I = 0; Local_u16I < Copy_u8SendLen; Local_u16I++) {
-		Write_Reg(FIFODataReg, Copy_pu8SendData[Local_u16I]);
-	}
+    /* ضبط التايمر ومهلة الحماية */
+    RFID_vWriteRegister(MFRC522_REG_T_MODE, TIMER_MODE_AUTO_PRESCALER_H);
+    RFID_vWriteRegister(MFRC522_REG_T_PRESCALER, TIMER_PRESCALER_L);
+    RFID_vWriteRegister(MFRC522_REG_T_RELOAD_H, TIMER_RELOAD_VAL_H);
+    RFID_vWriteRegister(MFRC522_REG_T_RELOAD_L, TIMER_RELOAD_VAL_L);
 
-	Write_Reg(CommandReg, Copy_u8Command);
-	if (Copy_u8Command == PCD_TRANSCEIVE) {
-		Write_Reg(BitFramingReg, Read_Reg(BitFramingReg) | 0x80);
-	}
+    /* ضبط التردد وهوائي الإرسال */
+    RFID_vWriteRegister(MFRC522_REG_TX_ASK, TX_ASK_FORCE_100);
+    RFID_vWriteRegister(MFRC522_REG_MODE, MODE_REG_TX_WAIT_RF);
 
-	Local_u16I = 2000;
-	do {
-		Local_u8N = Read_Reg(CommIrqReg);
-		Local_u16I--;
-	} while ((Local_u16I != 0) && !(Local_u8N & 0x01) && !(Local_u8N & Local_u8WaitIrq));
-
-	if (Local_u16I != 0 && !(Read_Reg(ErrorReg) & 0x1B)) {
-		Local_u8Status = MI_OK;
-		if (Copy_u8Command == PCD_TRANSCEIVE) {
-			Local_u8N = Read_Reg(FIFOLevelReg);
-			*Copy_pu16BackLen = Local_u8N * 8;
-			for (Local_u16I = 0; Local_u16I < Local_u8N; Local_u16I++) {
-				Copy_pu8BackData[Local_u16I] = Read_Reg(FIFODataReg);
-			}
-		}
-	}
-	return Local_u8Status;
+    /* تشغيل الهوائي Antenna ON */
+    u8 Local_u8TxState = RFID_u8ReadRegister(MFRC522_REG_TX_CONTROL);
+    RFID_vWriteRegister(MFRC522_REG_TX_CONTROL, Local_u8TxState | TX_CONTROL_ANTENNA_ON);
 }
 
-// --- High-Level Functions ---
-void MFRC522_Init(void) {
-	Write_Reg(CommandReg, PCD_RESETPHASE); // Soft Reset
-	Write_Reg(ModeReg, 0x3D);
-	
-	// Turn Antenna ON
-	u8 Local_u8Temp = Read_Reg(TxControlReg);
-	if (!(Local_u8Temp & 0x03)) {
-		Write_Reg(TxControlReg, Local_u8Temp | 0x03);
-	}
+u8 RFID_u8CheckCard(void) {
+    RFID_vWriteRegister(MFRC522_REG_COMMAND, MFRC522_CMD_IDLE);
+    RFID_vWriteRegister(MFRC522_REG_FIFO_LEVEL, FIFO_LEVEL_FLUSH);
+    RFID_vWriteRegister(MFRC522_REG_COM_IRQ, COM_IRQ_CLEAR_ALL);
+
+    RFID_vWriteRegister(MFRC522_REG_FIFO_DATA, PICC_CMD_REQA);
+    RFID_vWriteRegister(MFRC522_REG_BIT_FRAMING, BIT_FRAMING_START_SEND | BIT_FRAMING_7BITS);
+    RFID_vWriteRegister(MFRC522_REG_COMMAND, MFRC522_CMD_TRANSCEIVE);
+
+    u16 Local_u16Timeout = 2000;
+    while (Local_u16Timeout--) {
+        u8 Local_u8IRQ = RFID_u8ReadRegister(MFRC522_REG_COM_IRQ);
+        if (Local_u8IRQ & COM_IRQ_RX_DONE) {
+            return 1; // تم اكتشاف كارت
+        }
+        if (Local_u8IRQ & COM_IRQ_TIMER_TIMEOUT) {
+            break;
+        }
+    }
+    return 0; // لم يتم إيجاد كارت
 }
 
-u8 MFRC522_Request(u8 *Copy_pu8TagType) {
-	u16 Local_u16BackBits;
-	Write_Reg(BitFramingReg, 0x07);
-	Copy_pu8TagType[0] = PICC_REQIDL;
-	return ToCard(PCD_TRANSCEIVE, Copy_pu8TagType, 1, Copy_pu8TagType, &Local_u16BackBits);
-}
+u8 RFID_u8ReadUID(u8 *Copy_pu8UIDBuffer) {
+    RFID_vWriteRegister(MFRC522_REG_COMMAND, MFRC522_CMD_IDLE);
+    RFID_vWriteRegister(MFRC522_REG_FIFO_LEVEL, FIFO_LEVEL_FLUSH);
+    RFID_vWriteRegister(MFRC522_REG_COM_IRQ, COM_IRQ_CLEAR_ALL);
 
-u8 MFRC522_Anticoll(u8 *Copy_pu8SerNum) {
-	u16 Local_u16UnLen;
-	Write_Reg(BitFramingReg, 0x00);
-	Copy_pu8SerNum[0] = PICC_ANTICOLL;
-	Copy_pu8SerNum[1] = 0x20;
-	return ToCard(PCD_TRANSCEIVE, Copy_pu8SerNum, 2, Copy_pu8SerNum, &Local_u16UnLen);
+    RFID_vWriteRegister(MFRC522_REG_FIFO_DATA, PICC_CMD_ANTICOLL);
+    RFID_vWriteRegister(MFRC522_REG_FIFO_DATA, PICC_ANTICOLL_NVB);
+
+    RFID_vWriteRegister(MFRC522_REG_BIT_FRAMING, BIT_FRAMING_START_SEND | BIT_FRAMING_FULL_BYTES);
+    RFID_vWriteRegister(MFRC522_REG_COMMAND, MFRC522_CMD_TRANSCEIVE);
+
+    u16 Local_u16Timeout = 2000;
+    while (Local_u16Timeout--) {
+        u8 Local_u8IRQ = RFID_u8ReadRegister(MFRC522_REG_COM_IRQ);
+        if (Local_u8IRQ & COM_IRQ_RX_DONE) break;
+        if (Local_u8IRQ & COM_IRQ_TIMER_TIMEOUT) return 0;
+    }
+
+    /* قراءة الـ UID من الـ FIFO */
+    for (u8 Local_u8Index = 0; Local_u8Index < EXPECTED_ANTICOLL_BYTES; Local_u8Index++) {
+        Copy_pu8UIDBuffer[Local_u8Index] = RFID_u8ReadRegister(MFRC522_REG_FIFO_DATA);
+    }
+
+    /* فحص صحة البيانات بـ XOR Checksum */
+    u8 Local_u8BCC = Copy_pu8UIDBuffer[0] ^ Copy_pu8UIDBuffer[1] ^ Copy_pu8UIDBuffer[2] ^ Copy_pu8UIDBuffer[3];
+    return (Local_u8BCC == Copy_pu8UIDBuffer[4]) ? 1 : 0;
 }
